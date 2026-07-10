@@ -47,7 +47,7 @@ Directory overview:
 * `config/` — `config.ini` (defaults), `routes.ini`, `apiEndpoints.ini`, `crons.ini`, and `config/local/` for machine-local overrides.
 * `ui/` — dashboard templates (F3 template engine), JavaScript, CSS.
 * `install/` — web installer (delete after installation).
-* `libs/` — vendored dependencies (Fat-Free core, Ruler, PHPMailer, device-detector), used when no `vendor/` autoloader is present, so Composer is optional at runtime.
+* `libs/` — vendored dependencies (Fat-Free core, Ruler, PHPMailer, device-detector, Spyc), used when no `vendor/` autoloader is present, so Composer is optional at runtime.
 * `tests/` — PHPUnit test suite.
 
 Requirements: PHP 8.0–8.3 with `PDO_PGSQL` and `cURL`, PostgreSQL 12+. Background processing (rule checks, counters, enrichment) runs through cron:
@@ -96,7 +96,7 @@ Optional:
 | `phoneNumber` | Account phone number. |
 | `firstName`, `lastName`, `fullName` | Account display names. |
 | `userCreated` | Account registration timestamp (enables account-age rules). |
-| `eventType` | One of the types below; defaults to a plain page visit. |
+| `eventType` | One of the types below (optional). |
 | `pageTitle` | Human-readable title of the page/action. |
 | `userAgent` | Raw `User-Agent` header (enables device, bot, and AI-bot detection). |
 | `browserLanguage` | Raw `Accept-Language` header. |
@@ -115,10 +115,10 @@ Using precise types pays off: many rules key on them (failed logins, password ch
 
 ### Responses and limits
 
-* Success: `200` with an empty body — the event is stored, and validation corrections (if any) are recorded per field and shown in the dashboard logbook (`/logbook`).
-* `401` — missing or unknown `Api-Key` header.
-* `400` — validation error: a required field is missing or empty.
+* Accepted event: `204 No Content`. The sensor closes the connection immediately and finishes processing (device detection, enrichment, storage) after the client has disconnected, keeping ingestion latency out of your request path. Validation corrections (e.g. a repaired `eventTime`) are recorded per field in the dashboard logbook (`/logbook`).
+* Missing required field, or missing/unknown `Api-Key` header: the event is rejected. The response body is empty; the reason (validation error, unauthorized) is recorded in the logbook.
 * `429` — API overload protection triggered. The sensor applies a leaky-bucket limiter configured by `LEAKY_BUCKET_RPS` (default 10) and `LEAKY_BUCKET_WINDOW` (default 20 seconds).
+* `500` — unexpected processing error.
 * `503` — database unavailable.
 
 Every request, including rejected ones, is written to the logbook, so integration mistakes are visible in the dashboard.
@@ -131,7 +131,7 @@ Sending `blacklisting=true` with an event makes the sensor answer **synchronousl
 {"value": "203.0.113.10", "blacklisted": false}
 ```
 
-`blacklisted` is `true` when the event's IP, email, or phone was earlier blacklisted (manually or via thresholds) under your API key.
+`value` echoes the event's IP address and `blacklisted` is `true` when that IP was earlier blacklisted (manually or via thresholds) under your API key. Email and phone blacklist status is evaluated as well, but it is attached to the stored event rather than returned in this synchronous answer.
 
 ### CLI mode
 
@@ -419,7 +419,7 @@ class X03 extends \Tirreno\Assets\Rule {
 * `defineCondition()` declares the trigger with the [Ruler](https://github.com/bobthecow/Ruler) rule builder (`$this->rb`): combine context variables with `logicalAnd` / `logicalOr` / `logicalNot` and comparisons (`equalTo`, `greaterThan`, `lessThan`, ...).
 * Variables like `$this->rb['extra_one_digit_userid']` come from the rule **context** — the per-account fact sheet described next. Core context already covers scores, totals, device, IP, and email traits (e.g. `eup_ai_bot` used by D13).
 
-Rules are evaluated by the cron worker over accounts with fresh activity; `CHECK_RULE_USERS_LIMIT` (default 1000) caps how many accounts are re-scored per run. A rule can be dry-run from the dashboard with the *play* action on `/rules`.
+Rules are evaluated by the cron worker over accounts with fresh activity. A rule can also be dry-run from the dashboard with the *play* action on `/rules`, which tests it against the most recent accounts — `CHECK_RULE_USERS_LIMIT` (default 1000) caps how many.
 
 New core rules in v0.10.0: **I13** (IP belongs to suspicious ASN, driven by `assets/lists/asn.php`), **D11** (empty user agent), **D12** (empty browser language).
 
@@ -498,7 +498,7 @@ Defaults live in [`config/config.ini`](config/config.ini); machine-local overrid
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `CHECK_RULE_USERS_LIMIT` | `1000` | Max accounts re-scored per cron rule run. |
+| `CHECK_RULE_USERS_LIMIT` | `1000` | Max recent accounts evaluated when a rule is checked from the dashboard (*play* action on `/rules`). |
 | `RECALCULATE_TOTALS_ON_VISIT` | `true` | Recalculate entity totals on visit instead of deferring. |
 | `LOG_TO_STDERR` | `false` | Duplicate `tirreno('log')` output to stderr (container-friendly). |
 | `DEBUG` | `0` | `1` renders a stack trace on the error page (new behaviour in v0.10.0) and enables `tirreno('log')->debug()`. Never enable in production. |
@@ -545,13 +545,14 @@ The codebase is deliberately "low-tech": `declare(strict_types=1)` everywhere, n
 For development:
 
 ```bash
-composer install                  # dev tools (runtime works without vendor/)
+composer install                                        # dev tools (runtime works without vendor/)
 
-vendor/bin/phpcs                  # code style   — ruleset in phpcs.xml
-vendor/bin/phpstan analyse        # static analysis — phpstan.neon
-vendor/bin/phpunit                # tests        — phpunit.xml, tests/
-npx eslint ui/js                  # JS lint      — eslint.config.js
+vendor/bin/phpunit                                      # tests           — phpunit.xml, tests/
+vendor/bin/phpstan analyse --configuration=phpstan.neon # static analysis
+vendor/bin/phpcs -n                                     # code style      — ruleset in phpcs.xml
 ```
+
+The GitHub Actions workflow (`.github/workflows/ci.yml`) runs the same checks: the test suite across the supported PHP versions, plus a static-analysis job (PHPStan and PHP CodeSniffer). A JavaScript lint configuration for `ui/js` ships in `eslint.config.js` (flat config); ESLint itself is not vendored, so install it separately to use it (e.g. `npm install eslint` and `npx eslint ui/js`).
 
 Match the existing style when contributing: PSR-4 under `\Tirreno\` → `app/`, one class per file, aligned array assignments, and the `tirreno('...')` API instead of reaching into classes directly. Please review [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) and [SECURITY.md](SECURITY.md) (vulnerability reports) before submitting changes.
 
